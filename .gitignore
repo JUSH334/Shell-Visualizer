@@ -1,0 +1,25 @@
+# Build artifacts
+visualizer/dist/
+
+# Dependencies
+node_modules/
+
+# C shell build outputs
+shell/myshell
+shell/*.o
+shell/lex.yy.c
+shell/y.tab.c
+shell/y.tab.h
+shell/parser.tab.cc
+shell/parser.tab.hh
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
