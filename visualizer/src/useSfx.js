@@ -94,6 +94,10 @@ export function useSfx() {
         setTimeout(() => tone(659, 0.10, "triangle", 0.05), 90);
         setTimeout(() => tone(784, 0.24, "triangle", 0.06), 180);
       },
+      // Softer, higher-band burst for character-by-character text reveal.
+      // Fires once per typewriter tick — quieter and shorter than `tick`
+      // so it lands as a rhythm rather than a stream.
+      typewriter: () => noiseBurst(0.008, 0.016, 3700 + Math.random() * 700, 5),
     };
   }, [getCtx]);
 

@@ -56,6 +56,310 @@ const TOKEN_STYLES = {
   NEWLINE:              { text: THEME.dim,    border: THEME.faded,  dash: true },
 };
 
+// ───────────────────── assistant content ─────────────────────
+
+const ASSISTANT_GREETING =
+  "Type a command — or pick an example above — and I'll walk you through what the shell does with it, one step at a time.";
+
+// Two-line ASCII face. Cycled while running; static (frame 0) when idle.
+const ASSISTANT_FRAMES = [
+  ["[o o]", " \\_/ "],
+  ["[o o]", " \\o/ "],
+  ["[O O]", " \\o/ "],
+  ["[o o]", " \\-/ "],
+];
+
+// Natural-language list joiner: ["a", "b", "c"] -> "a, b, and c".
+function joinAnd(arr) {
+  if (arr.length === 0) return "";
+  if (arr.length === 1) return arr[0];
+  if (arr.length === 2) return `${arr[0]} and ${arr[1]}`;
+  return arr.slice(0, -1).join(", ") + ", and " + arr[arr.length - 1];
+}
+
+// ── reactive describers — produce per-phase narration of the current command ──
+
+function describeLex(tokens) {
+  const real = (tokens || []).filter(t => t.type !== "NEWLINE");
+  if (real.length === 0) return "Nothing to lex yet.";
+
+  const wordCount = real.filter(t => t.type === "WORD").length;
+  const pipeCount = real.filter(t => t.type === "PIPE").length;
+  const redirTypes = ["GREAT", "GREATGREAT", "LESS", "GREATAMPERSAND", "GREATGREATAMPERSAND"];
+  const redirCount = real.filter(t => redirTypes.includes(t.type)).length;
+  const hasBg = real.some(t => t.type === "AMPERSAND");
+
+  const parts = [];
+  const labels = [];
+  if (wordCount) labels.push(`${wordCount} WORD${wordCount === 1 ? "" : "s"}`);
+  if (pipeCount) labels.push(`${pipeCount} pipe${pipeCount === 1 ? "" : "s"}`);
+  if (redirCount) labels.push(`${redirCount} redirection${redirCount === 1 ? "" : "s"}`);
+  if (hasBg) labels.push("a background marker");
+
+  parts.push(`Read ${real.length} token${real.length === 1 ? "" : "s"} — ${joinAnd(labels)}.`);
+
+  // Preview the first few WORDs so the user can connect the labels to the
+  // actual content of their command.
+  const firstWords = real.filter(t => t.type === "WORD").slice(0, 3).map(t => `"${t.value}"`);
+  if (firstWords.length) {
+    parts.push(`First word${firstWords.length === 1 ? "" : "s"}: ${firstWords.join(", ")}.`);
+  }
+  return parts.join(" ");
+}
+
+function describeParse(parsed) {
+  if (!parsed || parsed.cmds.length === 0) return "Nothing to parse — empty input.";
+  const n = parsed.cmds.length;
+  const parts = [];
+
+  if (n === 1) {
+    const cmd = parsed.cmds[0];
+    const argv = cmd[0];
+    const argc = cmd.length - 1;
+    parts.push(`Single command: ${argv}${argc > 0 ? ` with ${argc} argument${argc === 1 ? "" : "s"}` : ""}.`);
+  } else {
+    const names = parsed.cmds.map(c => c[0]).join(" → ");
+    parts.push(`${n}-stage pipeline: ${names}.`);
+  }
+
+  if (parsed.inFile) parts.push(`Input comes from ${parsed.inFile}.`);
+  if (parsed.outFile && parsed.errFile === parsed.outFile) {
+    const verb = parsed.append ? "appends" : "writes";
+    parts.push(`Stdout and stderr both ${verb} to ${parsed.outFile}.`);
+  } else {
+    if (parsed.outFile) {
+      const verb = parsed.append ? "appends to" : "writes to";
+      parts.push(`Output ${verb} ${parsed.outFile}.`);
+    }
+    if (parsed.errFile) parts.push(`Stderr goes to ${parsed.errFile}.`);
+  }
+  if (parsed.bg) parts.push("Trailing & marks the whole pipeline as a background job.");
+
+  return parts.join(" ");
+}
+
+function describeExec(parsed) {
+  if (!parsed || parsed.cmds.length === 0) return "Nothing to execute.";
+  const n = parsed.cmds.length;
+  const pidRange = n === 1 ? `PID 1000` : `PIDs 1000–${999 + n}`;
+  const parts = [`Forking ${n} process${n === 1 ? "" : "es"} (${pidRange}).`];
+
+  if (n > 1) {
+    parts.push(`A pipe is opened between each adjacent pair — stdout of one feeds stdin of the next.`);
+  } else {
+    parts.push(`Single process, so no pipes are needed.`);
+  }
+
+  if (parsed.inFile) parts.push(`The first process reads from ${parsed.inFile}.`);
+  if (parsed.outFile) {
+    parts.push(`The last process writes to ${parsed.outFile}${parsed.append ? " (append mode)" : ""}.`);
+  }
+  return parts.join(" ");
+}
+
+function describeDone(parsed) {
+  if (!parsed || parsed.cmds.length === 0) return "Done.";
+  const n = parsed.cmds.length;
+  if (parsed.bg) {
+    return `Backgrounded — the shell didn't wait. The prompt is already back, and the ${n === 1 ? "process is" : `${n} processes are`} running independently.`;
+  }
+  return `Waited on PID ${999 + n} to exit, then returned to the prompt. The exit code is now available in $?.`;
+}
+
+// One row per visualizer phase. `concept` is the always-true explanation of
+// what this phase does in general; `describe` runs against the current
+// tokens / parsed state and narrates what just happened to the user's
+// specific command.
+const STEPS = [
+  {
+    key: "LEX",
+    concept: "The shell scans your input and breaks it into tokens. Spaces are dropped; symbols like | > < & become their own tokens; everything else is a WORD.",
+    describe: (tokens, _parsed) => describeLex(tokens),
+  },
+  {
+    key: "PARSE",
+    concept: "The shell groups the tokens into commands. Each | starts a new command; redirections (> < >>) attach as input/output settings; a trailing & marks the pipeline as background.",
+    describe: (_tokens, parsed) => describeParse(parsed),
+  },
+  {
+    key: "EXEC",
+    concept: "The shell creates a pipe for each |, then launches one process per command. Each process is wired to the right input and output (terminal, file, or pipe), then becomes the target program.",
+    describe: (_tokens, parsed) => describeExec(parsed),
+  },
+  {
+    key: "DONE",
+    concept: "The shell waits for the last process to finish, reads its exit code, and shows the next prompt. Background commands (&) skip the wait.",
+    describe: (_tokens, parsed) => describeDone(parsed),
+  },
+];
+
+function AssistantPanel({ phase, running, tokens, parsed, lastCmd, sfx }) {
+  const [frameIdx, setFrameIdx] = useState(0);
+  const [revealed, setRevealed] = useState(0);
+
+  // The greeting only shows on a truly fresh session — once any command
+  // has been run (lastCmd is set), we never fall back to the greeting,
+  // even during the brief window where `reset()` puts phase back to 0
+  // before the next phase timer fires.
+  const showGreeting = phase === 0 && !lastCmd;
+  const activeReactive = phase > 0 ? STEPS[Math.max(0, phase - 1)].describe(tokens, parsed) : "";
+  const currentText = showGreeting ? ASSISTANT_GREETING : activeReactive;
+  const speaking = revealed < currentText.length;
+
+  // Typewriter the current speech, with a matching reveal-tick sound.
+  // Reset on every phase change so each new step's reactive line types
+  // out from the start.
+  useEffect(() => {
+    setRevealed(0);
+    let r = 0;
+    const id = setInterval(() => {
+      r = Math.min(r + 2, currentText.length);
+      setRevealed(r);
+      if (r < currentText.length) sfx?.typewriter?.();
+      else clearInterval(id);
+    }, 35);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, tokens, parsed]);
+
+  // Face cycles frames while text is still typewriting. Settles to idle
+  // once the speech finishes.
+  useEffect(() => {
+    if (!speaking) { setFrameIdx(0); return; }
+    const id = setInterval(() => {
+      setFrameIdx((i) => (i + 1) % ASSISTANT_FRAMES.length);
+    }, 180);
+    return () => clearInterval(id);
+  }, [speaking]);
+
+  const face = speaking ? ASSISTANT_FRAMES[frameIdx] : ASSISTANT_FRAMES[0];
+
+  return (
+    <div style={{
+      position: "sticky", top: 18,
+      background: THEME.panel,
+      border: `1px solid ${THEME.bright}`,
+      boxShadow: `${glow(THEME.bright, 0.45)}, inset 0 0 16px ${THEME.bright}11`,
+      fontFamily: "'VT323', monospace",
+    }}>
+      {/* Header */}
+      <div style={{
+        padding: "6px 14px",
+        background: THEME.ghost,
+        borderBottom: `1px solid ${THEME.faded}`,
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+      }}>
+        <span style={{
+          color: THEME.bright, fontSize: 14, letterSpacing: 3,
+          textShadow: `0 0 2px ${THEME.bright}`,
+        }}>ASSISTANT</span>
+        <span style={{ color: THEME.base, fontSize: 13, letterSpacing: 1 }}>
+          {phase === 0 ? "READY" : `${phase} / ${STEPS.length}`}
+        </span>
+      </div>
+
+      {/* Character + headline */}
+      <div style={{ padding: "14px 16px", display: "flex", gap: 14, alignItems: "flex-start" }}>
+        <div style={{
+          color: THEME.hot, fontSize: 20, lineHeight: 1.05,
+          whiteSpace: "pre", textShadow: `0 0 2px ${THEME.hot}`,
+          flexShrink: 0, paddingTop: 2,
+        }}>
+          {face[0]}{"\n"}{face[1]}
+        </div>
+        <div style={{
+          flex: 1, color: THEME.bright,
+          fontSize: 16, lineHeight: 1.55,
+          minHeight: 50,
+        }}>
+          {showGreeting ? (
+            <>
+              {ASSISTANT_GREETING.slice(0, revealed)}
+              {speaking && <span className="term-blink" style={{ marginLeft: 1 }}>▎</span>}
+            </>
+          ) : (
+            <span style={{ fontFamily: "'VT323', monospace" }}>
+              <span style={{ color: THEME.dim, marginRight: 4 }}>$</span>
+              <span style={{ color: THEME.hot, textShadow: glow(THEME.hot, 0.4) }}>{lastCmd}</span>
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Accumulating step descriptions — text snaps in once a phase is
+          reached and stays put. Past steps remain readable forever. */}
+      <div style={{
+        borderTop: `1px solid ${THEME.faded}`,
+        padding: "14px 16px 16px",
+      }}>
+        <div style={{
+          color: THEME.base, fontSize: 12, letterSpacing: 2,
+          marginBottom: 10,
+        }}>STEPS</div>
+        {STEPS.map((step, i) => {
+          const sp = i + 1;
+          const reached = phase >= sp;
+          const active = phase === sp;
+          const completed = phase > sp;
+          const markerColor = active ? THEME.hot : completed ? THEME.bright : THEME.dim;
+          const marker = active ? "▸" : completed ? "✓" : "·";
+          return (
+            <div key={step.key} style={{
+              marginBottom: i === STEPS.length - 1 ? 0 : 14,
+              paddingBottom: i === STEPS.length - 1 ? 0 : 14,
+              borderBottom: i === STEPS.length - 1 ? "none" : `1px dashed ${THEME.faded}`,
+            }}>
+              <div style={{
+                color: markerColor,
+                fontSize: 16, letterSpacing: 2,
+                marginBottom: reached ? 7 : 0,
+                textShadow: active ? `0 0 2px ${THEME.hot}` : "none",
+              }}>
+                {marker} {step.key}
+              </div>
+              {reached && (
+                <div
+                  style={{
+                    paddingLeft: 16,
+                    animation: "fadeIn 0.35s",
+                  }}
+                >
+                  {/* What this phase does in general */}
+                  <div style={{
+                    color: THEME.base,
+                    fontSize: 14, lineHeight: 1.55,
+                    marginBottom: 8,
+                  }}>{step.concept}</div>
+
+                  {/* What just happened to the user's specific command —
+                      typewriter-reveals when this step is active, snaps to
+                      full once the phase moves past. */}
+                  <div style={{
+                    display: "flex", gap: 7,
+                    color: active ? THEME.hot : THEME.bright,
+                    fontSize: 14, lineHeight: 1.55,
+                  }}>
+                    <span style={{ color: active ? THEME.hot : THEME.base, flexShrink: 0 }}>→</span>
+                    <span>
+                      {(() => {
+                        const full = step.describe(tokens, parsed);
+                        return active ? full.slice(0, revealed) : full;
+                      })()}
+                      {active && speaking && (
+                        <span className="term-blink" style={{ marginLeft: 1 }}>▎</span>
+                      )}
+                    </span>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 const PhaseTab = ({ label, active, done, last }) => (
   <div style={{
     flex: 1, padding: "8px 10px", fontSize: 16, letterSpacing: 3, textAlign: "center",
@@ -78,16 +382,18 @@ const Token = ({ token, visible, delay }) => {
   const style = TOKEN_STYLES[token.type] || TOKEN_STYLES.WORD;
   return (
     <span style={{
-      display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 10px",
-      fontSize: 16, fontFamily: "'VT323', 'IBM Plex Mono', monospace",
+      display: "inline-flex", alignItems: "center", gap: 7, padding: "5px 12px",
+      fontSize: 18, fontFamily: "'VT323', 'IBM Plex Mono', monospace",
       background: "transparent",
       border: `1px ${style.dash ? "dashed" : "solid"} ${style.border}`,
       color: style.text,
-      textShadow: glow(style.text, 0.6),
+      // Crisp single-shadow definition — no halo, so letters stay sharp
+      // at this size. The border + color already make the chip distinct.
+      textShadow: `0 0 1.5px ${style.text}`,
       opacity: visible ? 1 : 0, transform: visible ? "translateY(0)" : "translateY(8px)",
       transition: `opacity 0.3s ${delay}ms, transform 0.3s ${delay}ms`,
     }}>
-      <span style={{ fontSize: 12, color: THEME.dim, letterSpacing: 1 }}>{token.type}</span>
+      <span style={{ fontSize: 13, color: THEME.base, letterSpacing: 1 }}>{token.type}</span>
       <span style={{ color: style.text, fontWeight: 500 }}>{token.value}</span>
     </span>
   );
@@ -187,6 +493,7 @@ export default function ShellVisualizer() {
   const [running, setRunning] = useState(false);
   const [appLoading, setAppLoading] = useState(true);
   const [appLoadShown, setAppLoadShown] = useState([]);
+  const [lastCmd, setLastCmd] = useState("");
   const inputRef = useRef(null);
   const timerRef = useRef([]);
 
@@ -218,6 +525,7 @@ export default function ShellVisualizer() {
   const runVisualization = (cmd) => {
     if (!cmd.trim()) return;
     reset();
+    setLastCmd(cmd.trim());
     setRunning(true);
     sfxConfirm();
 
@@ -258,14 +566,6 @@ export default function ShellVisualizer() {
 
   useEffect(() => () => clearTimers(), []);
 
-  const descriptions = [
-    "",
-    "LEX :: the shell scans your input and breaks it into tokens. Spaces are dropped; symbols like | > < & become their own tokens; everything else is a WORD.",
-    "PARSE :: the shell groups the tokens into commands. Each | starts a new command; redirections (> < >>) attach as input/output settings; a trailing & marks the pipeline as background.",
-    "EXEC :: the shell creates a pipe for each |, then launches one process per command. Each process is wired up to the right input and output (terminal, file, or pipe), then becomes the target program.",
-    "DONE :: the shell waits for the last process to finish, reads its exit code, and shows the next prompt. Background commands (&) skip the wait."
-  ];
-
   const phaseLabels = ["LEX", "PARSE", "EXEC", "DONE"];
   const phaseLabel = phase >= 1 && phase <= 4 ? phaseLabels[phase - 1] : "READY";
 
@@ -295,7 +595,7 @@ export default function ShellVisualizer() {
       <div className="crt-vignette" />
       <div className="crt-flicker" />
 
-      <div style={{ maxWidth: 1100, margin: "0 auto", position: "relative", zIndex: 1 }}>
+      <div style={{ maxWidth: 1500, margin: "0 auto", position: "relative", zIndex: 1 }}>
 
         {/* Toolbar */}
         <div style={{
@@ -347,6 +647,12 @@ export default function ShellVisualizer() {
             >↻ reset</button>
           </span>
         </div>
+
+        <div style={{
+          display: "flex", gap: 24, alignItems: "flex-start",
+          flexWrap: "wrap",
+        }}>
+        <main style={{ flex: "1 1 640px", minWidth: 0 }}>
 
         {/* Phase tab bar */}
         <div style={{ display: "flex", marginBottom: 16 }}>
@@ -436,14 +742,6 @@ export default function ShellVisualizer() {
         {/* Phase output */}
         {phase > 0 && (
           <div>
-            <p style={{
-              fontSize: 17, color: THEME.bright, lineHeight: 1.5, marginBottom: 18, minHeight: 40,
-              fontFamily: "'VT323', monospace", letterSpacing: 0.5, transition: "opacity 0.3s",
-            }}>
-              <span style={{ color: THEME.hot, textShadow: glow(THEME.hot, 0.5) }}>&gt;&gt; </span>
-              {descriptions[phase] || descriptions[4]}
-            </p>
-
             {phase >= 1 && tokens.length > 0 && (
               <div style={panel}>
                 <div style={panelHeader}>TOKENS</div>
@@ -542,6 +840,21 @@ export default function ShellVisualizer() {
               <span className={running ? "term-blink" : ""}>●</span> {running ? "BUSY" : phase === 4 ? "OK" : "IDLE"}
             </span>
           </span>
+        </div>
+        </main>
+
+        <aside style={{ flex: "1 1 320px", minWidth: 280, maxWidth: 400 }}>
+          {!appLoading && (
+            <AssistantPanel
+              phase={phase}
+              running={running}
+              tokens={tokens}
+              parsed={parsed}
+              lastCmd={lastCmd}
+              sfx={sfx}
+            />
+          )}
+        </aside>
         </div>
       </div>
 
